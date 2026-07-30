@@ -267,6 +267,9 @@
     .bundle-plugin-copy code { display:block; margin-top:2px; color:#8a6657; font-size:9px; }
     .bundle-plugin-copy p { margin:5px 0 0; color:#716a61; font-size:10px; line-height:1.55; }
     .plugin-role { color:#9b5b43 !important; }
+    .plugin-group-label { margin:14px 0 2px; font-size:13px; color:#4c463c; letter-spacing:.02em; }
+    .plugin-usage { color:#5c6a4f !important; }
+    .plugin-alts { color:#6d6292 !important; }
     .bundle-plugin img,.bundle-plugin .plugin-icon { width:28px; height:28px; border-radius:7px; }
     .bundle-plugin code { font-size:10px; }
     .copy-bundle { margin-top:12px; padding:9px 12px; border:0; border-radius:8px; color:#fff; background:#292521; font-weight:720; }
@@ -791,17 +794,163 @@ function catalogDescription(item) {
   return Array.isArray(value) ? value.join('；') : value;
 }
 
+const MODE_FALLBACK_CATEGORIES = {
+  zcode: ['开发工作流', '代码质量与测试', 'AI 与 Agent', '云平台与部署', '数据库与数据工程'],
+};
+
+function itemKeywordSets(item) {
+  const explicit = [...new Set([...(item.pluginTags ?? []), ...(item.stackHints ?? []), ...(item.specialtyTerms ?? [])])]
+    .map((value) => String(value).toLowerCase()).filter((value) => value.length >= 2);
+  const context = [
+    item.category, item.name, item.objective, item.focus, item.suitableFor,
+    ...(Array.isArray(item.scope) ? item.scope : [item.scope]),
+    ...(item.tasks ?? []), ...(item.deliverables ?? []), ...(item.phases ?? []),
+  ].filter(Boolean).map((value) => String(value).toLowerCase());
+  return { explicit, context, itemCategory: String(item.category ?? '') };
+}
+
+function pluginHaystack(plugin) {
+  return {
+    name: String(plugin.name).toLowerCase(),
+    zh: String(plugin.zhName ?? '').toLowerCase(),
+    category: String(plugin.category ?? ''),
+    text: [plugin.summary, plugin.details, ...(plugin.useCases ?? []), ...(plugin.tags ?? []), plugin.sourceDescription]
+      .filter(Boolean).join(' ').toLowerCase(),
+  };
+}
+
+function categoryTokens(value) {
+  return String(value ?? '').split(/[与、，,\s/·-]+/).filter((token) => token.length >= 2);
+}
+
+function scorePluginForItem(plugin, keywords) {
+  const haystack = pluginHaystack(plugin);
+  let score = 0;
+  for (const tag of keywords.explicit) {
+    if (haystack.name === tag) score += 8;
+    else if (haystack.name.includes(tag) || (tag.length <= 24 && tag.includes(haystack.name))) score += 5;
+    if (haystack.text.includes(tag)) score += 3;
+    if (haystack.zh.includes(tag)) score += 3;
+  }
+  for (const word of keywords.context) {
+    if (word.length < 2) continue;
+    if (haystack.text.includes(word)) score += 1;
+    if (haystack.category && word.includes(haystack.category.toLowerCase())) score += 2;
+  }
+  if (score > 0) score += (plugin.rating ?? 3) * 0.1;
+  return score;
+}
+
+const WORK_CATEGORY_RULES = [
+  [/法律|合规/, ['搜索与资料研究', '文档与内容创作', '协作与项目管理']],
+  [/医疗|健康|银发|养老/, ['搜索与资料研究', '协作与项目管理', '文档与内容创作']],
+  [/财税|金融|审计|支付|财会/, ['支付与金融', '搜索与资料研究', '文档与内容创作']],
+  [/销售|营销|客户|新消费|品牌|增长/, ['电商营销与销售', '搜索与资料研究', '设计图片与视频']],
+  [/电商|内容|新媒体|直播|短视频|出海|跨境/, ['电商营销与销售', '设计图片与视频', '搜索与资料研究']],
+  [/教育|培训|职业|课程/, ['文档与内容创作', '搜索与资料研究', '协作与项目管理']],
+  [/人力|行政|组织|人才|公共事务|基础行政/, ['协作与项目管理', '文档与内容创作', '搜索与资料研究']],
+  [/供应链|制造|质量|工业|物流|农业|建筑|地产|环境|能源|循环|材料|采购|运维/, ['协作与项目管理', '搜索与资料研究', '企业业务平台']],
+  [/数据|隐私|安全|治理|合成数据/, ['企业业务平台', '搜索与资料研究', '协作与项目管理']],
+  [/AI|数字/, ['协作与项目管理', '文档与内容创作', '搜索与资料研究']],
+  [/航天|海洋|低空|具身|交通|生物|气候|县域|区域|公共服务/, ['企业业务平台', '搜索与资料研究', '协作与项目管理']],
+];
+
+const WORK_DEFAULT_CATEGORIES = ['搜索与资料研究', '文档与内容创作', '协作与项目管理'];
+
+const WORK_DEV_TEXT = /代码示例|SDK|API 参考|Web 开发|持续集成|CI\/CD|技术文档/;
+
+function workAffinityCategories(item) {
+  const probe = `${item.category ?? ''} ${item.name ?? ''} ${item.focus ?? ''}`;
+  const matched = WORK_CATEGORY_RULES.filter(([pattern]) => pattern.test(probe)).flatMap(([, categories]) => categories);
+  return [...new Set([...matched, ...WORK_DEFAULT_CATEGORIES])];
+}
+
+function recommendationReason(itemName, plugin, matched) {
+  if (!matched) {
+    return `为“${itemName}”提供${plugin.category ?? '通用'}支撑能力，属于工作区通用底座；与具体任务的关联较弱时可在替代方案中替换。`;
+  }
+  const useCase = plugin.useCases?.[0] ?? '专业流程执行';
+  return `在“${itemName}”中负责${useCase}；${plugin.recommendation ?? '覆盖当前工作区的关键环节。'}`;
+}
+
+function pickAlternatives(plugin, selectedNames, plugins) {
+  return plugins
+    .filter((candidate) => candidate.category === plugin.category
+      && candidate.name.toLowerCase() !== plugin.name.toLowerCase()
+      && !selectedNames.has(candidate.name.toLowerCase()))
+    .sort((left, right) => (right.rating ?? 0) - (left.rating ?? 0) || left.name.localeCompare(right.name))
+    .slice(0, 2)
+    .map((candidate) => ({
+      name: candidate.name,
+      zhName: candidate.zhName ?? candidate.name,
+      note: candidate.barrier ? `上手门槛${candidate.barrier}` : '同类别替代',
+    }));
+}
+
 function pluginRecommendations(item, plugins) {
+  if (!plugins.length) return [];
+  const itemName = catalogName(item);
+  const mode = catalogMode(item) === 'work' ? 'work' : 'zcode';
+  const keywords = itemKeywordSets(item);
   const byName = pluginMap(plugins);
-  return catalogPluginNames(item).flatMap((name) => {
+  const ordered = [];
+  const seen = new Set();
+  const push = (plugin, matched) => {
+    if (ordered.length >= 6 || seen.has(plugin.name.toLowerCase())) return;
+    seen.add(plugin.name.toLowerCase());
+    ordered.push({ plugin, matched });
+  };
+  for (const name of catalogPluginNames(item)) {
     const plugin = byName.get(name.toLowerCase());
-    return plugin ? [{
-      name: plugin.name,
-      zhName: plugin.zhName ?? plugin.name,
-      function: plugin.summary ?? '支持当前工作区的专业流程。',
-      status: 'unknown-at-build',
-    }] : [];
-  });
+    if (plugin) push(plugin, true);
+  }
+  if (mode === 'work') {
+    const affinity = workAffinityCategories(item);
+    const rank = new Map(affinity.map((category, index) => [category, index]));
+    const pool = plugins.filter((plugin) => rank.has(plugin.category)
+      && !WORK_DEV_TEXT.test([plugin.summary, plugin.details, ...(plugin.tags ?? [])].filter(Boolean).join(' ')));
+    pool
+      .map((plugin) => ({ plugin, score: scorePluginForItem(plugin, keywords) }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score
+        || rank.get(left.plugin.category) - rank.get(right.plugin.category)
+        || (right.plugin.rating ?? 0) - (left.plugin.rating ?? 0)
+        || left.plugin.name.localeCompare(right.plugin.name))
+      .forEach((entry) => push(entry.plugin, true));
+    [...pool]
+      .sort((left, right) => rank.get(left.category) - rank.get(right.category)
+        || (right.rating ?? 0) - (left.rating ?? 0)
+        || left.name.localeCompare(right.name))
+      .forEach((plugin) => push(plugin, false));
+  } else {
+    plugins
+      .map((plugin) => ({ plugin, score: scorePluginForItem(plugin, keywords) }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score
+        || (right.plugin.rating ?? 0) - (left.plugin.rating ?? 0)
+        || left.plugin.name.localeCompare(right.plugin.name))
+      .forEach((entry) => push(entry.plugin, true));
+    if (ordered.length < 6) {
+      plugins
+        .filter((plugin) => MODE_FALLBACK_CATEGORIES.zcode.includes(plugin.category))
+        .sort((left, right) => (right.rating ?? 0) - (left.rating ?? 0) || left.name.localeCompare(right.name))
+        .forEach((plugin) => push(plugin, false));
+    }
+  }
+  return ordered.map(({ plugin, matched }, index) => ({
+    name: plugin.name,
+    zhName: plugin.zhName ?? plugin.name,
+    category: plugin.category ?? '',
+    function: plugin.summary ?? '支持当前工作区的专业流程。',
+    usage: [...(plugin.useCases ?? [])],
+    reason: recommendationReason(itemName, plugin, matched),
+    required: index < 3,
+    rating: plugin.rating ?? null,
+    barrier: plugin.barrier ?? '',
+    requiresAccount: /API|云|平台|账号|支付|广告|CRM/i.test(plugin.sourceDescription ?? ''),
+    alternatives: pickAlternatives(plugin, seen, plugins),
+    status: 'unknown-at-build',
+  }));
 }
 
 function catalogMode(item, kind = '') {
@@ -1110,10 +1259,15 @@ function buildTeamWorkspaceFiles(team, roleMap, plugins = []) {
       if (!items.length) { const empty = make('div','empty'); empty.append(make('h3','','没有匹配的专家团队'),make('p','','尝试搜索团队目标、分类、角色名或插件标签。')); elements.scenarioGrid.append(empty); }
       elements.scenarioCount.textContent = '显示 ' + items.length + ' / 100 个专家团队';
     }
-    function bundlePlugin(name, context) {
-      const plugin = PLUGINS.find((item) => item.name.toLowerCase() === name.toLowerCase()); const node = make('button','bundle-plugin'); node.type = 'button';
-      if (!plugin) { node.append(make('code','',name)); node.disabled = true; return node; }
-      node.append(iconFor(plugin)); const copy = make('span','bundle-plugin-copy'); copy.append(make('strong','',plugin.zhName),make('code','',plugin.name),make('p','',plugin.summary),make('p','plugin-role','在“' + context.name + '”中用于支持当前专业流程；使用前确认真实安装状态。')); node.append(copy);
+    function bundlePlugin(record, context) {
+      const plugin = PLUGINS.find((item) => item.name.toLowerCase() === record.name.toLowerCase()); const node = make('button','bundle-plugin'); node.type = 'button';
+      if (!plugin) { node.append(make('code','',record.name)); node.disabled = true; return node; }
+      node.append(iconFor(plugin)); const copy = make('span','bundle-plugin-copy');
+      copy.append(make('strong','',plugin.zhName),make('code','',plugin.name),make('p','',plugin.summary));
+      if (record.reason) copy.append(make('p','plugin-role','为什么装：' + record.reason));
+      if (record.usage && record.usage.length) copy.append(make('p','plugin-usage','用法：' + record.usage.join('；') + '。'));
+      if (record.alternatives && record.alternatives.length) copy.append(make('p','plugin-alts','替代方案：' + record.alternatives.map((alt) => alt.zhName + '（' + alt.name + '，' + alt.note + '）').join('；')));
+      node.append(copy);
       node.addEventListener('click',(event) => { event.stopPropagation(); elements.dialog.close(); showOnlyPlugin(plugin); }); return node;
     }
     function addDialogList(parent,title,items) { if (!items || !items.length) return; const section = make('section','dialog-section'); section.append(make('h3','',title)); const list = make('ul','detail-list'); items.forEach((item) => list.append(make('li','',String(item)))); section.append(list); parent.append(section); }
@@ -1158,7 +1312,7 @@ function buildTeamWorkspaceFiles(team, roleMap, plugins = []) {
     function downloadSoloWorkspace(item,files) { downloadZip(files,item.slug,item.slug + '-zcode-solo.zip','单兵 ZIP 已生成'); }
     function downloadTeamWorkspace(item,files) { downloadZip(files,item.slug,item.slug + '-zcode-team.zip','团队 ZIP 已生成'); }
     function addRiskBadges(parent,item) { const values = [item.riskLevel ? '风险：' + item.riskLevel : '', item.licenseGate ? '资质门禁：需要' : '资质门禁：按任务判断', item.humanReview ? '人工复核：' + item.humanReview : '', item.auditTrail ? '审计：' + (Array.isArray(item.auditTrail) ? item.auditTrail.join('；') : item.auditTrail) : '', item.safetyGate ? '安全门禁：' + item.safetyGate : ''].filter(Boolean); if (!values.length) return; const section = make('section','dialog-section'); section.append(make('h3','','风险与门禁')); const tags = make('div','tags'); values.forEach((value) => tags.append(make('span','tag risk-badge',value))); section.append(tags); parent.append(section); }
-    function addPluginRecommendations(parent,item) { const recommendations = pluginRecommendations(item,PLUGINS); const section = make('section','dialog-section'); section.append(make('h3','','推荐插件、功能与使用方法'),make('p','dialog-hint','点击插件可跳到 273 插件图鉴中的完整中文说明。')); const list = make('div','bundle-list'); recommendations.forEach((record) => list.append(bundlePlugin(record.name,item))); section.append(list); const copy = make('button','copy-bundle','复制全部英文插件名'); copy.type = 'button'; copy.addEventListener('click',() => copyText(recommendations.map((record) => record.name).join('\n')).then(() => showToast('插件清单已复制'))); section.append(copy); parent.append(section); }
+    function addPluginRecommendations(parent,item) { const recommendations = pluginRecommendations(item,PLUGINS); const section = make('section','dialog-section'); section.append(make('h3','','必装插件与推荐插件'),make('p','dialog-hint','必装是工作区运转的最小集合，推荐按需启用；每个插件标注功能、为什么装和替代方案。点击插件可跳到 273 插件图鉴中的完整中文说明。')); if (!recommendations.length) { section.append(make('p','dialog-hint','当前目录暂无可匹配的插件，可先在图鉴中搜索。')); parent.append(section); return; } const required = recommendations.filter((record) => record.required); const optional = recommendations.filter((record) => !record.required); const reqLabel = make('h4','plugin-group-label','必装插件（' + required.length + '）'); const reqList = make('div','bundle-list'); required.forEach((record) => reqList.append(bundlePlugin(record,item))); section.append(reqLabel,reqList); if (optional.length) { const optLabel = make('h4','plugin-group-label','推荐插件（' + optional.length + '）'); const optList = make('div','bundle-list'); optional.forEach((record) => optList.append(bundlePlugin(record,item))); section.append(optLabel,optList); } const copy = make('button','copy-bundle','复制全部英文插件名'); copy.type = 'button'; copy.addEventListener('click',() => copyText(recommendations.map((record) => record.name).join('\n')).then(() => showToast('插件清单已复制'))); section.append(copy); parent.append(section); }
     function openExpert(item) {
       const files = buildSoloWorkspaceFiles(item,PLUGINS); elements.dialogContent.replaceChildren(); const close = make('button','dialog-close','×'); close.type = 'button'; close.setAttribute('aria-label','关闭'); close.addEventListener('click',() => elements.dialog.close()); elements.dialogContent.append(close);
       const description = state.expertMode === 'work' ? item.focus : (Array.isArray(item.scope) ? item.scope.join('；') : item.scope); const heading = make('div',''); heading.append(make('span','dialog-kicker',(state.expertMode === 'work' ? 'WORK SOLO / ' : 'ZCODE SOLO / ') + item.category),make('h2','',item.name)); elements.dialogContent.append(heading,make('p','dialog-fit',description));
